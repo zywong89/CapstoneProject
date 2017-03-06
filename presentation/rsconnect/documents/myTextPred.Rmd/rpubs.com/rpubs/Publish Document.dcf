@@ -1,0 +1,8 @@
+name: Publish Document
+title:
+account: rpubs
+server: rpubs.com
+appId: https://api.rpubs.com/api/v1/document/256340/049d755d69b94f1c820e042358f5a76c
+bundleId: https://api.rpubs.com/api/v1/document/256340/049d755d69b94f1c820e042358f5a76c
+url: http://rpubs.com/zywong89/256340
+when: 1488810157.9623
