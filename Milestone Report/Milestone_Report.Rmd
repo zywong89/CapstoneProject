@@ -1,0 +1,273 @@
+---
+title: "Data Science Capstone - Milestone Report"
+author: "Zhen Yao"
+date: "15th February 2017"
+output: html_document
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = FALSE, comment = "")
+knitr::opts_knit$set(root.dir = "/Users/zywong89/Desktop/Data Science Specialization/P10 Data Science Capstone/data/en_US") # Path to the original data
+# Libraries needed: knitr, rJava, RWeka, SnowballC, tau, tm, wordcloud
+library(knitr)
+library(tm)
+library(tau)
+library(SnowballC)
+library(wordcloud)
+library(rJava)
+options(mc.cores = 1) # Need to set this, otherwise NGramTokenizer will hang over there.
+library(RWeka)
+```
+
+## Synopsis
+The report demonstrates my exploratory analysis and goals for the eventual text prediction app and algorithm (that will be available in the final report). The motivation for this report is to:  
+
+1. Demonstrate that I've downloaded the data and have successfully loaded it in.  
+2. Create a basic report of summary statistics about the data sets.  
+3. Report any interesting findings that I amassed so far.  
+4. Get feedback on my plans for creating a prediction algorithm and Shiny app.
+
+## Data Collection and Pre-Processing
+The [training data](https://d396qusza40orc.cloudfront.net/dsscapstone/dataset/Coursera-SwiftKey.zip) is from a corpus called [HC Corpora](www.corpora.heliohost.org). There are 3 categories of documents in the corpus: blogs, news and twitter posts. The files have been language filtered but may still contain some foreign text. For the beginning approach of building a text prediction algorithm, only the **English** database is used in the following analyses. Due to computation limitations, only **1%** of documents from each category is sampled for analysis and modeling. In fact, a relevatively few representative random sample is sufficient to be used to infer facts about a population. The code for collecting the sample data is demonstrated as follows:
+
+```{r sampleCorpus, echo = TRUE, cache = TRUE}
+# Create a directory for sample data
+if(!file.exists("sample")) dir.create("sample")
+
+# Check if all sample data already exists
+existsSample <- sum(setdiff(dir(), "sample") == dir("sample")) == length(setdiff(dir(), "sample"))
+
+# Sample the data
+if(!existsSample) {
+        set.seed(12345)
+        for(doc in setdiff(dir(), "sample")) {
+                con <- file(doc, "r")
+                all <- readLines(con, skipNul = TRUE)
+                close(con)
+                sub <- all[rbinom(n = length(all) * .01, size = length(all), prob = .5)]
+                write.csv(sub, paste0("sample/", gsub(".txt$", "", doc), ".txt"), row.names = FALSE)
+        }
+        rm(con, all, sub, doc)
+}
+
+# Load sample data into a corpus
+sample <- Corpus(DirSource(directory = "sample", encoding = "UTF-8"),
+                 readerControl = list(reader = readPlain, language = "en_US", load = TRUE))
+```
+
+Now the sample corpus of raw files is ready for basic exploration. Figure 1 shows the information about size, lines and word counts of each file. The blog posts have the least number of lines but the most number of words while the Twitter posts have the most number of lines but the least number of words, which makes sense that there is no error in loading the files.
+
+#### Figure 1: Summary about the Corpus
+```{r exploreCorpus}
+summary(sample)
+setwd("sample")
+info <- system("wc -c -l -w en_US.blogs.txt en_US.twitter.txt en_US.news.txt", intern = TRUE)
+info <- read.table(textConnection(stripWhitespace(info)), sep = " ")[, c(5, 4, 2, 3)]
+names(info) <- c("File Name", "Size (bytes)", "Total Lines", "Total Words" )
+kable(info)
+```
+
+Next, the raw data are pre-processed so that further analyses will give meaningful outputs. Since this report aims to provide basic understanding of approaches used for public readers, the R code that generates different outputs are not displayed here. Note that pre-processing steps are applied to the whole corpus (not on seperate type of files). Without going into further technical details, the pre-processing steps (in sequential order) are summarized as follows:  
+
+1. Convert special characters (e.g. \#\/\@|) and URLs to space.  
+2. Convert all chracters to lowercase.  
+3. Remove all possible profanity words. The dictionary of profanity words are obtained from [here](https://github.com/LDNOOBW/List-of-Dirty-Naughty-Obscene-and-Otherwise-Bad-Words/blob/master/en)  
+4. Remove all numbers.  
+5. Two datasets are created here. One with removed English stopwords and another one remains as it is. The following steps are applied to both datasets.  
+6. Remove all punctuations.  
+7. Stemming (i.e. remove word suffixes).  
+8. Strip all white spaces into a single space.  
+
+```{r preProcess, cache = TRUE}
+# Get a Backup Sample
+docs <- sample
+# Convert Special Characters, URLs to Spaces
+toSpace <- content_transformer(function(x, pattern) gsub(pattern, "", x))
+docs <- tm_map(docs, toSpace, pattern = "#|/|@|\\|")
+docs <- tm_map(docs, toSpace, pattern = "(f|ht)tp(s?)://(.*)[.][a-z]+")
+docs <- tm_map(docs, toSpace, pattern = "www.(.*)[.][a-z]+")
+# Transform Words to Lowercase
+docs <- tm_map(docs, tolower)
+# Remove Profanity Words Before Filtering Numbers
+profanity <- read.csv("../en_profanity_words", header = FALSE,
+                      stringsAsFactors = FALSE)
+profanity <- profanity$V1
+docs <- tm_map(docs, removeWords, words = profanity)
+# Remove Numbers
+docs <- tm_map(docs, removeNumbers)
+# Remove Stopwords (for initial analysis, before removing punctuations)
+docsKWIC <- tm_map(docs, removeWords, stopwords("english"))
+# Remove Punctuations
+docs <- tm_map(docs, removePunctuation)
+docsKWIC <- tm_map(docsKWIC, removePunctuation)
+# Stemming (Erasing Word Suffixes)
+docs <- tm_map(docs, stemDocument, language = "english")
+docsKWIC <- tm_map(docsKWIC, stemDocument, language = "english")
+# Strip White Spaces
+docs <- tm_map(docs, stripWhitespace)
+docsKWIC <- tm_map(docsKWIC, stripWhitespace)
+# Convert the Corpus Back to PlainTextDocument
+docs <- tm_map(docs, PlainTextDocument)
+docsKWIC <- tm_map(docsKWIC, PlainTextDocument)
+```
+
+## Exploratory Analysis
+The first step in building a predictive model for text is understanding the distribution and relationship between the words, tokens, and phrases in the text. The goal of this section is to understand the basic relationships in the data and prepare to build the first linguistic models. Each document in the corpus is tokenized (with *one-*, *two-* and *three-*gram models) using `TermDocumentMatrix` and `NGramTokenizer` from `tm` and `RWeka` packages, respectively. For the *one-*gram model, the analysis is done on the dataset with English stopwords removed.  
+Figure 2 shows the summary of *one-*gram (Unigram), *two-*gram (Bigram) and *three-*gram (Trigram) word counts. Apparently, the word counts are highly positively skewed. This fact is also supported by histograms in Figure 3. Also, the words counts are much more peaked for the Trigram model compared to the Unigram and Bigram models.
+
+```{r termDocMatrix, cache = TRUE}
+# 1-gram Analysis (without stopwords)
+docs1gTDM <- TermDocumentMatrix(docsKWIC)
+docs1gMat <- as.matrix(docs1gTDM)
+docs1gCount <- data.frame(term = rownames(docs1gMat),
+                          freq = rowSums(docs1gMat),
+                          row.names = 1:dim(docs1gMat)[1])
+docs1gCount <- docs1gCount[order(docs1gCount$freq, decreasing = TRUE), ]
+
+# 1-gram Analysis (with stopwords)
+docs1gTDM2 <- TermDocumentMatrix(docs)
+docs1gMat2 <- as.matrix(docs1gTDM2)
+docs1gCount2 <- data.frame(term = rownames(docs1gMat2),
+                          freq = rowSums(docs1gMat2),
+                          row.names = 1:dim(docs1gMat2)[1])
+docs1gCount2 <- docs1gCount2[order(docs1gCount2$freq, decreasing = TRUE), ]
+
+# 2-gram Analysis
+twoGramTokenizer <- function(x) NGramTokenizer(x, Weka_control(min = 2, max = 2))
+docs2gTDM <- TermDocumentMatrix(docs, control = list(tokenize = twoGramTokenizer))
+docs2gMat <- as.matrix(docs2gTDM)
+docs2gCount <- data.frame(term = rownames(docs2gMat),
+                          freq = rowSums(docs2gMat),
+                          row.names = 1:dim(docs2gMat)[1])
+docs2gCount <- docs2gCount[order(docs2gCount$freq, decreasing = TRUE), ]
+
+# 3-gram Analysis
+threeGramTokenizer <- function(x) NGramTokenizer(x, Weka_control(min = 3, max = 3))
+docs3gTDM <- TermDocumentMatrix(docs, control = list(tokenize = threeGramTokenizer))
+docs3gMat <- as.matrix(docs3gTDM)
+docs3gCount <- data.frame(term = rownames(docs3gMat),
+                          freq = rowSums(docs3gMat),
+                          row.names = 1:dim(docs3gMat)[1])
+docs3gCount <- docs3gCount[order(docs3gCount$freq, decreasing = TRUE), ]
+```
+
+#### Figure 2: Summary of Word Counts for Unigram, Bigram and Trigram Models
+```{r figure2, cache = TRUE, fig.align = 'center', warning = FALSE}
+# Summary
+summary <- rbind(summary(docs1gCount$freq), summary(docs2gCount$freq), summary(docs3gCount$freq))
+summary <- cbind(c("Unigram", "Bigram", "Trigram"),
+                 c(length(docs1gTDM$i), length(docs2gTDM$i), length(docs3gTDM$i)), summary)
+colnames(summary)[1:2] <- c("Model", "Total Terms")
+kable(summary)
+```
+
+#### Figure 3: Distributions of Word Counts
+```{r figure3, cache = TRUE, fig.align = 'center', warning = FALSE}
+# Distributions of Word Frequency
+par(mfrow = c(1, 3))
+hist(docs1gCount$freq, breaks = 400, xlim = c(1, 200), col = "red",
+     main = "Unigram", xlab = "Number of Occurrence")
+hist(docs2gCount$freq, breaks = 400, xlim = c(1, 200), col = "cyan",
+     main = "Bigram", xlab = "Number of Occurrence")
+hist(docs3gCount$freq, breaks = 30, xlim = c(1, 200), col = "lightgreen",
+     main = "Trigram", xlab = "Number of Occurrence")
+```
+
+Unigram model is expected to have lesser terms due to removal of English stopwords. As a result, the stopwords do not appear in the top 5 most frequently occurred words as shown in Figure 4. On the other hand, it can be observed that all words in Bigram models are English stopwords and the word "the" occurred the most in both Bigram and Trigram models. More frequently occurred words are available in the wordclouds in Figure 5. The size of the words are proportional to the frequency of occurrence (apologies for small figures and redundant spaces as I have no idea how to deal with them after various attempts).
+
+#### Figure 4: Top 5 Most Frequently Occurred Words
+```{r figure4, cache = TRUE, fig.align = 'center', warning = FALSE}
+# Top 5 Most-Frequently Occurred Word(s)
+topWords <- cbind(1:5, head(docs1gCount, 5), head(docs2gCount, 5), head(docs3gCount, 5))
+colnames(topWords) <- c("Rank", "Unigram", "Freq", "Bigram", "Freq", "Trigram", "Freq")
+row.names(topWords) <- NULL
+kable(topWords)
+```
+
+#### Figure 5: Word Clouds of Unigram, Bigram and Trigram Models
+```{r figure5, cache = TRUE, fig.align = 'center', warning = FALSE}
+# Word Cloud
+par(mfrow = c(1, 3))
+wordcloud(docs1gCount$term, docs1gCount$freq,
+          scale = c(3, 0.3), colors = brewer.pal(8, "Accent"),
+          random.order = FALSE, min.freq = 100, max.words = 100)
+wordcloud(docs2gCount$term, docs2gCount$freq,
+          scale = c(3, 0.5), colors = brewer.pal(8, "Accent"),
+          random.order = FALSE, min.freq = 100, max.words = 100)
+wordcloud(docs3gCount$term, docs2gCount$freq,
+          scale = c(3, 0.3), colors = brewer.pal(8, "Accent"),
+          random.order = FALSE, min.freq = 100, max.words = 100)
+```
+
+The last part of the exploratory analysis is the coverage plot. The training dataset must have sufficient number of different words and terms acting as the "dictionary" for text predictions. Figure 6 shows the coverage rate against the number of unique and most-occurring words. Note that stopwords are included for the Unigram model.
+
+#### Figure 6: Coverage Plot
+```{r coveragePlot, fig.align = 'center', warning = FALSE}
+# Coverage Plot Functions
+wordCoverage <- function(freq, p) {
+        num <- 1
+        cumSums <- cumsum(sort(freq, decreasing = TRUE))
+        total <- sum(freq)
+        pcts <- round(cumSums[1] / total, 4)
+        while(pcts < p) {
+                num <- num + 1
+                pcts <- round(cumSums[num] / total, 4)
+        }
+        num
+}
+# Coverage Plots
+par(mfrow = c(1, 3))
+docs1g50cov <- wordCoverage(docs1gCount2$freq, 0.5)
+docs1g90cov <- wordCoverage(docs1gCount2$freq, 0.9)
+with(docs1gCount2, plot(1:nrow(docs1gCount2), round(100 * cumsum(freq) / sum(freq), 2),
+                       main = "Unigram Model", type = "l",
+                       xlab = "No of Words", ylab = "Coverage (%)"))
+lines(rep(docs1g50cov, 2), c(0, 50), col = "red", lty = 2)
+lines(c(0, docs1g50cov), rep(50, 2), col = "red", lty = 2)
+lines(rep(docs1g90cov, 2), c(0, 90), col = "green", lty = 2)
+lines(c(0, docs1g90cov), rep(90, 2), col = "green", lty = 2)
+points(c(docs1g50cov, docs1g90cov), c(50, 90), type = "p", cex = 0.5, col = c("red", "green"))
+text(x = docs1g50cov + 2500, y = 50, docs1g50cov)
+text(x = docs1g90cov + 2500, y = 90 - 2, docs1g90cov)
+
+docs2g50cov <- wordCoverage(docs2gCount$freq, 0.5)
+docs2g90cov <- wordCoverage(docs2gCount$freq, 0.9)
+with(docs2gCount, plot(1:nrow(docs2gCount), round(100 * cumsum(freq) / sum(freq), 2),
+                       main = "Bigram Model", type = "l",
+                       xlab = "No of Words", ylab = "Coverage (%)"))
+lines(rep(docs2g50cov, 2), c(0, 50), col = "red", lty = 2)
+lines(c(0, docs2g50cov), rep(50, 2), col = "red", lty = 2)
+lines(rep(docs2g90cov, 2), c(0, 90), col = "green", lty = 2)
+lines(c(0, docs2g90cov), rep(90, 2), col = "green", lty = 2)
+points(c(docs2g50cov, docs2g90cov), c(50, 90), type = "p", cex = 0.5, col = c("red", "green"))
+text(x = docs2g50cov + 15000, y = 50, docs2g50cov)
+text(x = docs2g90cov + 15000, y = 90 - 2, docs2g90cov)
+
+docs3g50cov <- wordCoverage(docs3gCount$freq, 0.5)
+docs3g90cov <- wordCoverage(docs3gCount$freq, 0.9)
+with(docs3gCount, plot(1:nrow(docs3gCount), round(100 * cumsum(freq) / sum(freq), 2),
+                       main = "Trigram Model", type = "l",
+                       xlab = "No of Words", ylab = "Coverage (%)"))
+lines(rep(docs3g50cov, 2), c(0, 50), col = "red", lty = 2)
+lines(c(0, docs3g50cov), rep(50, 2), col = "red", lty = 2)
+lines(rep(docs3g90cov, 2), c(0, 90), col = "green", lty = 2)
+lines(c(0, docs3g90cov), rep(90, 2), col = "green", lty = 2)
+points(c(docs3g50cov, docs3g90cov), c(50, 90), type = "p", cex = 0.5, col = c("red", "green"))
+text(x = docs3g50cov + 22000, y = 50, docs3g50cov)
+text(x = docs3g90cov + 22000, y = 90 - 2, docs3g90cov)
+```
+
+In general, the number of words required to achieve desired coverage increases greatly from the Unigram model to the Trigram model, which will significantly impact storage and prediction performance if our corpora is to include *4-*gram tokens and above.  
+
+## Further Discussions
+Note that currently the analyses are performed on UTF-code symbols (i.e. mainly US English based), in which very likely the corpora contains some foreign language words. When it is necessary to evaluate words from foreign languages, one can compare the words based on different language dictionaries. Hoewever, the probability of occurrence of these words is generally low and it does not worth the time to deep dive into the such an evaluation and filter at the moment.  
+Lastly, one might think of alternative ways to increase the coverage for words that may not be in the corpora or using a smaller number of words in the dictionary to cover the same number of phrases. One is to represent the the corresponding verb, adjective(s) and nouns (singlular and plural forms) by a single word, instead of stemming. For example, "goes", "going" and "go" can be interpret as the same word "go". By capturing the grammar and structures of a language (via code and functions, which indeed requires some efforts), the coverage can be increased without having to greatly increase hardware resources (i.e. storage and memory).
+
+## Conclusion and Next Steps
+Basically that's it. Here are my initial plans of further steps:  
+
+1. Explore further on the relationship between words.
+2. Build *n-*gram models to predict texts.
+3. Enchance the performance of prediction algorithm.
+4. Summarize everything into a Shiny app together with presentation slides.
+5. Never give up! Work all the way to completion and graduation. :)

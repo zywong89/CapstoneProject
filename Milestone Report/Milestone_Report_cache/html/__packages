@@ -1,0 +1,10 @@
+base
+knitr
+NLP
+tm
+tau
+SnowballC
+RColorBrewer
+wordcloud
+rJava
+RWeka
